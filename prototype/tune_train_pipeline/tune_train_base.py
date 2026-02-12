@@ -2,16 +2,51 @@ import json
 import logging
 import os
 import pickle
+import shutil
 import traceback
-
 import numpy as np
 import pandas as pd
 import pybroker
 from pybroker.strategy import WalkforwardWindow
+
+from pybroker_trainer.strategy_loader import STRATEGY_CLASS_MAP, load_strategy_class
 from quant_engine import NumpyEncoder
 from tools.file_wrapper import convert_to_json_serializable
+from pathlib import Path
+from pybroker_trainer.config_loader import CONFIG_DIR
+
 
 logger = logging.getLogger(__name__)
+
+
+train_tickers = ['SPY', 'DIA', 'IWM', 'XLK', 'XLV', 'QQQ', 'WMT', 'T', 'JPM', 'BAC',
+                 'C', 'CAT', 'FDX', 'PFE', 'COST', 'AMZN', 'AAPL', 'INTC', 'DIS', 'HD',
+                 'NFLX', 'UNH', 'PG', 'KO', 'CSCO', 'BA']
+
+backtest_tickers = ['AAPL','MSFT','NVDA','GOOGL','AMZN','META','AVGO','TSLA','NFLX','ADBE',
+                    'CRM','NOW','ASML','TSM','CAT','DE','UNP','JPM','GS','AAL',
+                    'JNJ','UNH','PG','KO','NEE','DUK','PLUG','RIVN','HOOD','DNN']
+
+ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
+
+def get_all_strategy_types():
+    return STRATEGY_CLASS_MAP.keys()
+
+def is_ml_strategy(strategy_type: str) -> bool:
+    if strategy_type  in get_all_strategy_types() :
+        strategy_class = load_strategy_class(strategy_type)
+        return strategy_class().is_ml_strategy
+    return False
+
+def get_current_path(file):
+    return Path(file).resolve()  # resolve() gives absolute path
+
+def get_project_dir():
+    current_file = get_current_path(__file__)
+    # print(f"Current file: {current_file}")
+    project_dir = current_file.parent.parent.parent
+    #print(f"Project directory: {project_dir}")
+    return project_dir
 
 
 # --- NEW: Custom Strategy class for Expanding Window Walk-Forward ---
@@ -109,7 +144,7 @@ def log_walkforward_split_dates(data_df, start_date, end_date, strategy_config, 
 def save_walkforward_artifacts(wf, portfolio_name, result):
     """Helper function to save all assets from a walk-forward run."""
     logger.info(f"--- Saving artifacts for {portfolio_name} - {wf._strategy_type} ---")
-    model_dir = os.path.join('../pybroker_trainer', 'artifacts')
+    model_dir = ARTIFACTS_DIR
     os.makedirs(model_dir, exist_ok=True)
 
     # --- Always save core backtest artifacts ---
@@ -156,3 +191,48 @@ def save_walkforward_artifacts(wf, portfolio_name, result):
         with open(params_filename, 'w') as f:
             json.dump(convert_to_json_serializable(wf._last_best_params), f, indent=4)
         logger.info(f"Saved best hyperparameters from last fold to {params_filename}")
+
+
+
+def load_hyper_params(strategy_type: str) -> dict:
+    config_path = os.path.join(CONFIG_DIR, f"{strategy_type}_hyper_params.json")
+    specific_params = dict()
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            specific_params = json.load(f)
+            logger.info(f"Loaded hyper_params from {config_path}")
+            logger.info(specific_params)
+    else:
+        logger.info(f"File {config_path} doesn't exit")
+
+    return specific_params
+
+def load_model(strategy_type: str):
+    model_path = os.path.join(CONFIG_DIR, f"{strategy_type}_model.pkl")
+    model = None
+    if os.path.exists(model_path):
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+            logger.info(f"Loaded model from {model_path}")
+    else:
+        logger.info(f"File {model_path} doesn't exit")
+    return model
+
+def copy_to_strategy_configs(source, dest):
+    dest_path = os.path.join(CONFIG_DIR, dest)
+    source_path = os.path.join(ARTIFACTS_DIR, source)
+    if not os.path.exists(source_path):
+        logger.error(f"File {source_path} doesn't exit")
+    shutil.copyfile(source_path, dest_path)
+
+
+def print_full(s):
+    with pd.option_context(
+        'display.max_rows', None,
+        'display.max_columns', None,
+        'display.max_colwidth', None,
+        'display.width', None,  # Ensures the line doesn't break
+        'display.expand_frame_repr', False  # Prevents wrapping to a reset line
+    ):
+        print(s)
+

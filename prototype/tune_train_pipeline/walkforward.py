@@ -1,16 +1,16 @@
+import json
 import logging
+import os
 import traceback
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Optional
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pybroker
-
-from prototype.walkforward_helper import log_walkforward_split_dates, save_walkforward_artifacts
-from core.logging_config import setup_logging
+from prototype.tune_train_pipeline.tune_train_base import log_walkforward_split_dates, save_walkforward_artifacts, \
+    load_hyper_params, ARTIFACTS_DIR
 from lightgbm import LGBMClassifier
 from pybroker import PositionMode, StrategyConfig
 from pybroker_trainer.config_loader import load_strategy_config
@@ -22,16 +22,20 @@ from skopt.space import Real, Integer
 
 from quant_engine import BASE_CONTEXT_COLUMNS, _prepare_base_data, PassThroughModel, custom_predict_fn, \
     ExpandingWindowStrategy, prepare_metrics_df_for_display, plot_performance_vs_benchmark, plot_feature_importance
+from tools.file_wrapper import convert_to_json_serializable
 
 # --- Logging Configuration ---
 logger = logging.getLogger(__name__)
 
+pd.set_option('future.no_silent_downcasting', True)
+
 class WalkForward:
 
-    def __init__(self):
-        self.new()
+    def __init__(self, collect_train_data=False):
+        self.reset()
+        self._collect_train_data = collect_train_data
 
-    def new(self):
+    def reset(self):
         self._tickers = None
         self._strategy_type = None
         self._features = []
@@ -48,23 +52,35 @@ class WalkForward:
         self._start_date = None
         self._end_date = None
         self._model = None
+        self._hyper_params = None
+        self._total_train_data = None
+        self._portfolio_name = None
 
     def get_model(self, **kwargs):
         if self._model is None:
-            self._model = LGBMClassifier(**kwargs)
+            self._model = LGBMClassifier(verbosity=-1, **kwargs)
         return self._model
 
-    def init_run(self, tickers:list[str], i_strategy_type, itune_hyperparameters,  preloaded_data_df, preloaded_features, i_start_date, i_end_date, use_tuned_strategy_params, override_params, disable_inner_parallelism):
-        self.new()
+    def append_train_data(self, train_data):
+        if not self._collect_train_data:
+            return
+        if self._total_train_data is None:
+            self._total_train_data = train_data
+        else:
+            self._total_train_data = pd.concat([self._total_train_data, train_data], ignore_index=True)
+
+    def init_run(self, portfolio_name, tickers:list[str], strategy_type, tune_hyperparameters,  preloaded_data_df, preloaded_features, start_date, end_date, use_tuned_strategy_params, override_params, disable_inner_parallelism, use_tuned_hyper_params):
+        self.reset()
+        self._portfolio_name = portfolio_name
         self._tickers = tickers
-        self._start_date = i_start_date
-        if i_end_date is None:
+        self._start_date = start_date
+        if end_date is None:
             self._end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         else:
-            self._end_date = i_end_date
+            self._end_date = end_date
 
-        self._strategy_type = i_strategy_type
-        self._tune_hyperparameters = itune_hyperparameters
+        self._strategy_type = strategy_type
+        self._tune_hyperparameters = tune_hyperparameters
 
         # --- Load strategy config from JSON file ---
         self._strategy_class = load_strategy_class(self._strategy_type)
@@ -76,9 +92,19 @@ class WalkForward:
             self._strategy_params = load_strategy_config(self._strategy_type, base_params)
         else:
             self._strategy_params = base_params
+
+        # --------------------------------------------------------------
+        if use_tuned_hyper_params:
+            self._hyper_params = load_hyper_params(self._strategy_type)
+        else:
+            self._hyper_params = dict()
+
+        # --------------------------------------------------------------
         # Allow overriding parameters for optimization
         if override_params:
             logger.info(f"Overriding strategy parameters with: {override_params}")
+            self._strategy_params.update(override_params)
+
         if self._strategy_class:
             self._strategy_instance = self._strategy_class(params=self._strategy_params)
             self._is_ml = self._strategy_instance.is_ml_strategy
@@ -140,7 +166,7 @@ class WalkForward:
         if train_data.empty or len(train_data) < min_total_samples:
             logger.warning(
                 f"[{symbol}] Training data is empty or has insufficient samples ({len(train_data)} < {min_total_samples}). No model will be trained for this fold.")
-            model = LGBMClassifier(random_state=42, n_jobs=1, **model_config)
+            model = LGBMClassifier(verbosity=-1, random_state=42, n_jobs=1, **model_config)
             return {'model': model, 'features': self._features}
 
         # Check for minimum samples in the minority class
@@ -149,7 +175,7 @@ class WalkForward:
                 'target'].value_counts().min() < min_class_samples:
                 logger.warning(
                     f"[{symbol}] Minority class has too few samples ({train_data['target'].value_counts().min()} < {min_class_samples}). No model will be trained for this fold.")
-                model = LGBMClassifier(random_state=42, n_jobs=1, **model_config)
+                model = LGBMClassifier(verbosity=-1, random_state=42, n_jobs=1, **model_config)
                 return {'model': model, 'features': self._features}
         return None
 
@@ -183,9 +209,6 @@ class WalkForward:
     def train_fn(self, symbol, train_data, test_data, **kwargs):
         from sklearn.model_selection import train_test_split  # Local import for this function
         model_config = self._strategy_instance.get_model_config()
-        print(f"train_data.columns: {train_data.columns}")
-        company_id = train_data['company_id'].unique()
-        print(f"train_fn() company_id={company_id}")
         # --- NEW: Enhanced logging and checks for data validity ---
         train_start = train_data['date'].min().date() if not train_data.empty else 'N/A'
         train_end = train_data['date'].max().date() if not train_data.empty else 'N/A'
@@ -196,10 +219,11 @@ class WalkForward:
         if train_data.empty:
             logger.warning(
                 f"[{symbol}] Training data is empty for this fold. This is expected if the stock did not exist for the full period. Returning untrained model.")
-            model = LGBMClassifier(random_state=42, n_jobs=1, **model_config)
+            model = LGBMClassifier(verbosity=-1, random_state=42, n_jobs=1, **model_config)
             return {'model': model, 'features': self._features}
 
         train_data = self.train_fn_prepare_train_data(train_data, symbol)
+        self.append_train_data(train_data)
         model_bundle = self.train_fn_check_min_requirement(symbol, train_data, **model_config)
         if model_bundle is not None: return model_bundle    # failed of min_requirement check
 
@@ -223,7 +247,6 @@ class WalkForward:
                 can_tune = False
 
         if can_tune:
-            print('-------------------> can tune ')
             best_params = self.tune_hyperparameters_with_gp_minimize(
                 train_data=train_data,
                 features=self._features,
@@ -242,7 +265,6 @@ class WalkForward:
                 self._all_feature_importances.append(final_model.feature_importances_)
             return {'model': final_model, 'features': self._features}
         else:
-            print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx> no tuning ')
             # --- Train with default hyperparameters (no tuning) ---
             logger.info("Running with default hyperparameters (no tuning).")
             # --- Train LGBM with default hyperparameters ---
@@ -256,7 +278,7 @@ class WalkForward:
 
             n_jobs = 1 if self._strategy_params.get('disable_inner_parallelism') else -1
             default_lgbm_params = {'random_state': 42, 'n_jobs': n_jobs, 'class_weight': 'balanced',
-                                   'min_child_samples': 5, **model_config}
+                                   'min_child_samples': 5, **model_config, **self._hyper_params}
 
             temp_model = self.get_model(**default_lgbm_params)
             temp_model.fit(sub_train[self._features], sub_train['target'].astype(int))
@@ -297,20 +319,21 @@ class WalkForward:
                                  plot_results: bool = True, save_assets: bool = False, override_params: dict = None,
                                  use_tuned_strategy_params: bool = False, disable_inner_parallelism: bool = False,
                                  preloaded_data_df: pd.DataFrame = None, preloaded_features: list = None,
-                                 commission_cost: float = 0.0, calc_bootstrap: bool = True, istop_event_checker=None):
+                                 commission_cost: float = 0.0, calc_bootstrap: bool = True, stop_event_checker=None,
+                                 use_tuned_hyper_params: bool = False
+                                 ):
         """
         Runs the full walk-forward analysis for a given ticker.
         """
         try:
             # --- Unify default end_date handling ---
-            data_df = self.init_run(tickers, strategy_type, tune_hyperparameters, preloaded_data_df, preloaded_features, start_date, end_date, use_tuned_strategy_params, override_params, disable_inner_parallelism)
+            data_df = self.init_run(portfolio_name, tickers, strategy_type, tune_hyperparameters, preloaded_data_df, preloaded_features, start_date, end_date, use_tuned_strategy_params, override_params, disable_inner_parallelism, use_tuned_hyper_params)
 
             if not self.check_min_total_setups_for_run(data_df, 60):
                 return None, []
             # Filter out features that might not have been calculated or don't exist
             # _features = [f for f in data_df.columns if f in _features]
             # data_df.dropna(subset=_features + ['target'], inplace=True)
-            print(f"---> features=[{self._features}]")
             if self._is_ml:
                 pybroker.register_columns(self._features)
             pybroker.register_columns(self._context_columns_to_register)  # Always register context columns
@@ -365,7 +388,7 @@ class WalkForward:
 
             # --- Annualize Sharpe and Sortino Ratios ---
             if result and hasattr(result, 'metrics') and hasattr(result, 'metrics_df'):
-                # The result object is immutable. We create a new object with the annualized metrics_df.
+                # The result object is immutable. We create a reset object with the annualized metrics_df.
                 display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d')
                 savable_result = replace(result, metrics_df=display_metrics_df)
             else:
@@ -400,6 +423,25 @@ class WalkForward:
         return result, self._all_quality_scores  # Return the result object and quality scores
         # ------end of run_pybroker_walkforward ---------------------------------------------------
 
+    def tune_save_hyperparameters(self):
+        if self._total_train_data is None:
+            logger.info("No train_data to tune!")
+            return
+        self._last_best_params = self.tune_hyperparameters_with_gp_minimize(
+            train_data=self._total_train_data,
+            features=self._features,
+            model_config=self._strategy_instance.get_model_config(),
+            stop_event_checker=None,
+            symbol="total"
+        )
+        logger.info(f" Best hyperparameters found: {self._last_best_params}")
+
+        params_filename = os.path.join(ARTIFACTS_DIR, f'{self._portfolio_name}_{self._strategy_type}_best_params.json')
+        with open(params_filename, 'w') as f:
+            json.dump(convert_to_json_serializable(self._last_best_params), f, indent=4)
+        logger.info(f"Saved best hyperparameters from last fold to {params_filename}")
+
+
     @staticmethod
     def tune_hyperparameters_with_gp_minimize(train_data, features, model_config, stop_event_checker, symbol):
         """
@@ -428,7 +470,7 @@ class WalkForward:
                 return 1.0  # Return a high value (bad score) for minimization
 
             param_dict = {name: val for name, val in zip(dimensions_names, params)}
-            model = LGBMClassifier(random_state=42, n_jobs=1, class_weight='balanced', **model_config, **param_dict)
+            model = LGBMClassifier(verbosity=-1, random_state=42, n_jobs=1, class_weight='balanced', **model_config, **param_dict)
 
             cv_splitter = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
             scoring_metric = 'roc_auc_ovr' if model_config.get('objective') == 'multiclass' else 'roc_auc'
