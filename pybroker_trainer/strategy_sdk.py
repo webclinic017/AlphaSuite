@@ -172,11 +172,19 @@ class BaseStrategy(ABC):
 
     def get_trader(self, model_name: Optional[str], params_map: dict):
         """
-        Returns an instance of the appropriate trader for this strategy.
-        This default implementation selects the trader based on `is_ml_strategy`.
-        Individual strategies can override this for custom trader logic if needed.
+        Instantiates and returns the strategy's trader.
+
+        By convention, it looks for an inner class named 'Trader'. If found,
+        it instantiates that. Otherwise, it falls back to a default trader
+        based on whether the strategy is ML-based or rule-based.
+
+        Args:
+            model_name: The name of the model to use.
+            params_map: A dictionary mapping symbols to their parameters.
         """
-        if self.is_ml_strategy:
+        if hasattr(self, 'Trader'):
+            return self.Trader(model_name=model_name, params_map=params_map)
+        elif self.is_ml_strategy:
             return BaseTrader(model_name=model_name, params_map=params_map)
         else:
             return RuleBasedTrader(model_name=None, params_map=params_map)
