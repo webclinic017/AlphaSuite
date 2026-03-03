@@ -11,8 +11,7 @@ This module provides:
 from typing import Union
 import pandas as pd
 import talib as ta  
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
+from langchain_core.prompts import PromptTemplate
 import numpy as np
 import logging
 
@@ -393,8 +392,8 @@ Analysis should be data-driven and avoid predictions of future price movements. 
                 template=technical_analysis_prompt,
             )
 
-            chain = LLMChain(llm=llm, prompt=prompt_template)
-            technical_analysis_results = chain.run(
+            chain = prompt_template | self.llm
+            technical_analysis_results = chain.invoke(
                 ticker=ticker,
                 analysis_date=analysis_date,  
                 daily_data=daily_summary,
@@ -402,6 +401,8 @@ Analysis should be data-driven and avoid predictions of future price movements. 
                 monthly_data=monthly_summary,
             )
 
+            if hasattr(technical_analysis_results, 'content'):
+                return technical_analysis_results.content
             return technical_analysis_results
 
         except Exception as e:

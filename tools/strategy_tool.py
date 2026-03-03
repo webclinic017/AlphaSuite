@@ -3,6 +3,7 @@ import json
 import traceback
 from typing import Dict, Optional
 
+from langchain_core.prompts import PromptTemplate
 from tools.file_wrapper import LLMClient, remove_json_marker
 
 # --- Strategy Ingredients ---
@@ -86,24 +87,26 @@ def generate_strategy_blueprint(llm_client: LLMClient) -> Optional[Dict]:
     The output must be a JSON object that maps directly to a Python class inheriting from `BaseStrategy`.
     
     **Output JSON Structure:**
-    {{
+    {{{{
         "strategy_name": "snake_case_name (e.g., rsi_mean_reversion)",
         "class_name": "CamelCaseName (e.g., RsiMeanReversionStrategy)",
         "description": "A brief technical description of the edge.",
-        "parameters": {{
-            "param_name": {{ "type": "int|float", "default": value, "tuning_range": [min, max] }}
-        }},
+        "parameters": {{{{
+            "param_name": {{{{ "type": "int|float", "default": value, "tuning_range": [min, max] }}}}
+        }}}},
         "required_features": ["list", "of", "column", "names", "needed", "for", "ml", "model"],
         "logic_add_features": "Pseudocode for 'add_strategy_specific_features' method. How to calculate indicators using pandas/ta-lib.",
         "logic_get_setup_mask": "Pseudocode for 'get_setup_mask' method. Boolean logic for entry (True = setup found)."
-    }}
+    }}}}
     
     Ensure the logic is mathematically sound and uses standard libraries (pandas, numpy, talib).
     Return ONLY the JSON object.
     """
 
     try:
-        response_content = llm_client.get_response(prompt).strip()
+        # Use PromptTemplate to handle the escaping of braces for JSON
+        final_prompt = PromptTemplate.from_template(prompt).format()
+        response_content = llm_client.get_response(final_prompt).strip()
         json_str = remove_json_marker(response_content)
         blueprint_data = json.loads(json_str)
 

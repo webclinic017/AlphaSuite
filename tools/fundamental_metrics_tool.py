@@ -7,8 +7,7 @@ from typing import Union
 import numpy as np
 from sqlalchemy import func
 import pandas as pd
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
+from langchain_core.prompts import PromptTemplate
 from markdown_pdf import MarkdownPdf, Section
 
 from core.db import get_db
@@ -719,8 +718,10 @@ class FinancialAnalysisTool:
                 template=prompt_template,
             )
 
-            chain = LLMChain(llm=llm, prompt=prompt)
-            report_content = chain.run(llm_input)
+            chain = prompt | self.llm
+            report_content = chain.invoke(llm_input)
+            if hasattr(report_content, 'content'):
+                return report_content.content
 
             return report_content
 
